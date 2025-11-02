@@ -123,7 +123,11 @@ def analyze_for_signal(df):
         if wick_pct >= wick_threshold and vol_mult >= vol_spike_mult:
             cand_idx = i
             break
-    out['support'] = float(support) if not np.isnan(support) else None
+    support_val = support.iloc[-1] if hasattr(support, "iloc") else support
+if pd.notna(support_val):
+    out['support'] = float(support_val)
+else:
+    out['support'] = None
     out['cand_idx'] = cand_idx
     if cand_idx is None:
         out['ok'] = False
