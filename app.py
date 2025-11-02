@@ -117,7 +117,7 @@ def analyze_for_signal(df):
     # scan last 8 candles for stop-hunt like behavior
     for i in range(len(df)-2, max(len(df)-10, 0), -1):
         c = df.iloc[i]
-        wick_pct = ((support - c['Low'])/support*100) if support>0 else 0
+        wick_pct = np.where((support.fillna(0) > 0), ((support - c['Low'])/support)*100, 0)
         vol_baseline = df['vol_ma'].iloc[i] if df['vol_ma'].iloc[i]>0 else 1
         vol_mult = c['Volume'] / vol_baseline
         if wick_pct >= wick_threshold and vol_mult >= vol_spike_mult:
