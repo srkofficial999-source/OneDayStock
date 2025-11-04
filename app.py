@@ -1,194 +1,174 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import ta
-import time
 import requests
 from datetime import datetime
+import time
 
-# =====================================
-# 🔹 CONFIGURATION
-# =====================================
-st.set_page_config(page_title="Intraday AI System V2.2", layout="wide")
+# ================== SETTINGS ==================
+INTERVAL = "5m"  # Intraday interval
+CHECK_EVERY = 300  # seconds (5 mins)
 
-STOCKS = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS"]
-INTERVAL = "5m"
-REFRESH_MINUTES = 5
-
-# Telegram credentials (from Streamlit Secrets)
+# For Streamlit Cloud, put these in "Secrets" section
 TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
 
-# =====================================
-# 🔹 TELEGRAM FUNCTIONS
-# =====================================
+# ================== TELEGRAM ALERT ==================
 def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
     try:
-        r = requests.post(url, data=data)
-        if r.status_code != 200:
-            st.warning(f"⚠️ Telegram send failed: {r.text}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        params = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+        requests.get(url, params=params)
     except Exception as e:
-        st.error(f"❌ Telegram error: {e}")
+        st.warning(f"Telegram Error: {e}")
 
+# ================== TEST TELEGRAM ==================
 def test_telegram_connection():
-    test_msg = f"✅ Telegram Connected Successfully!\n🕒 {datetime.now().strftime('%H:%M:%S')}"
+    test_msg = f"✅ Telegram connected successfully at {datetime.now().strftime('%H:%M:%S')}"
     send_telegram(test_msg)
-    st.success("Telegram test message sent — check your Telegram app 📱")
+    st.success("Test message sent to Telegram!")
 
-# =====================================
-# 🔹 ANALYZE STOCK FUNCTION (CLEAN FIX)
-# =====================================
+# ================== ANALYZE STOCK ==================
 def analyze_stock(symbol):
-    data = yf.download(symbol, period="1d", interval=INTERVAL, progress=False)
-    if data is None or len(data) < 30:
+    try:
+        data = yf.download(symbol, period="1d", interval=INTERVAL, progress=False)
+        if data is None or len(data) < 30:
+            return None
+
+        # ✅ Clean data properly
+        data = data[["Open", "High", "Low", "Close", "Volume"]].copy()
+        data = data.dropna().reset_index(drop=True)
+
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            data[col] = pd.to_numeric(data[col], errors="coerce")
+        data = data.dropna()
+
+        if data.empty:
+            return None
+
+        close_series = pd.Series(data["Close"].values, dtype=float)
+
+        # ✅ Calculate Indicators
+        data["EMA9"] = ta.trend.ema_indicator(close_series, window=9)
+        data["EMA20"] = ta.trend.ema_indicator(close_series, window=20)
+        data["RSI"] = ta.momentum.rsi(close_series, window=14)
+        data["MACD"] = ta.trend.macd_diff(close_series)
+        data["VWAP"] = ta.volume.volume_weighted_average_price(
+            high=data["High"],
+            low=data["Low"],
+            close=data["Close"],
+            volume=data["Volume"]
+        )
+
+        data = data.dropna().reset_index(drop=True)
+        if data.empty:
+            return None
+
+        latest = data.iloc[-1]
+        signals = []
+
+        # === LOGIC ===
+        if latest["EMA9"] > latest["EMA20"]:
+            signals.append("EMA Bullish")
+        if latest["RSI"] > 55:
+            signals.append("RSI Strong")
+        if latest["MACD"] > 0:
+            signals.append("MACD Bullish")
+        if latest["Close"] > latest["VWAP"]:
+            signals.append("Above VWAP")
+        if latest["Volume"] > data["Volume"].mean() * 1.5:
+            signals.append("Volume Spike")
+
+        if len(signals) >= 3:
+            signal_type = "BUY"
+            sl = round(latest["Close"] * 0.985, 2)
+            target = round(latest["Close"] * 1.015, 2)
+        elif len(signals) <= 2:
+            signal_type = "SELL"
+            sl = round(latest["Close"] * 1.015, 2)
+            target = round(latest["Close"] * 0.985, 2)
+        else:
+            return None
+
+        return {
+            "symbol": symbol,
+            "price": round(latest["Close"], 2),
+            "signal": signal_type,
+            "sl": sl,
+            "target": target,
+            "reason": ", ".join(signals[:3]),
+            "time": datetime.now().strftime("%H:%M:%S")
+        }
+
+    except Exception as e:
+        st.error(f"⚠️ Error analyzing {symbol}: {e}")
+        send_telegram(f"⚠️ Error analyzing {symbol}: {e}")
         return None
 
-    # 🧹 Clean Data (Fix: EMA/RSI error)
-    data = data.dropna()
-    data = data[["Open", "High", "Low", "Close", "Volume"]]
-    data["Close"] = pd.to_numeric(data["Close"], errors="coerce")
-    data = data.dropna(subset=["Close"])
-    close_series = data["Close"].astype(float)
+# ================== ALERT ON TARGET / SL ==================
+def check_hit_conditions(stock_data, live_price):
+    if stock_data["signal"] == "BUY":
+        if live_price >= stock_data["target"]:
+            return "🎯 Target Hit!"
+        elif live_price <= stock_data["sl"]:
+            return "❌ Stop Loss Hit!"
+    elif stock_data["signal"] == "SELL":
+        if live_price <= stock_data["target"]:
+            return "🎯 Target Hit!"
+        elif live_price >= stock_data["sl"]:
+            return "❌ Stop Loss Hit!"
+    return None
 
-    # --- Technical Indicators ---
-    data["EMA9"] = ta.trend.ema_indicator(close_series, window=9)
-    data["EMA20"] = ta.trend.ema_indicator(close_series, window=20)
-    data["RSI"] = ta.momentum.rsi(close_series, window=14)
-    data["MACD"] = ta.trend.macd_diff(close_series)
-    data["VWAP"] = ta.volume.volume_weighted_average_price(
-        high=data["High"], low=data["Low"], close=data["Close"], volume=data["Volume"]
-    )
+# ================== STREAMLIT UI ==================
+st.title("📊 Intraday Stock AI System V2.3")
+st.caption("Powered by YFinance + Telegram + EMA/RSI/MACD/VWAP logic")
 
-    latest = data.iloc[-1]
-    signals = []
+stocks_input = st.text_area("Enter Stock Symbols (comma separated):", "RELIANCE.NS, TCS.NS, HDFCBANK.NS")
+stocks = [s.strip() for s in stocks_input.split(",") if s.strip()]
 
-    if latest["EMA9"] > latest["EMA20"]:
-        signals.append("EMA Bullish")
-    if latest["RSI"] > 55:
-        signals.append("RSI Strong")
-    if latest["MACD"] > 0:
-        signals.append("MACD Bullish")
-    if latest["Close"] > latest["VWAP"]:
-        signals.append("Above VWAP")
-    if latest["Volume"] > data["Volume"].mean() * 1.5:
-        signals.append("Volume Spike")
-
-    if len(signals) >= 3:
-        signal_type = "BUY"
-        sl = round(latest["Close"] * 0.985, 2)
-        target = round(latest["Close"] * 1.015, 2)
-    elif len(signals) <= 2:
-        signal_type = "SELL"
-        sl = round(latest["Close"] * 1.015, 2)
-        target = round(latest["Close"] * 0.985, 2)
-    else:
-        return None
-
-    reason = ", ".join(signals[:3])
-    return {
-        "symbol": symbol,
-        "price": round(latest["Close"], 2),
-        "signal": signal_type,
-        "sl": sl,
-        "target": target,
-        "reason": reason,
-        "time": datetime.now().strftime("%H:%M:%S")
-    }
-
-# =====================================
-# 🔹 STREAMLIT UI
-# =====================================
-st.title("📈 Intraday AI System V2.2")
-st.caption("AI-based Intraday Signals • Auto Telegram Alerts • Clean Data Safe")
-
-if st.button("📡 Test Telegram Connection"):
+if st.button("🔔 Test Telegram Connection"):
     test_telegram_connection()
 
-st.divider()
-st.subheader("🔍 Live Signal Analysis")
+if st.button("🚀 Run Intraday Scan"):
+    results = []
+    st.info("Analyzing... Please wait 1–2 minutes.")
 
-placeholder = st.empty()
-active_trades = {}
+    for s in stocks:
+        result = analyze_stock(s)
+        if result:
+            results.append(result)
+            msg = (
+                f"📈 {result['signal']} Alert for {result['symbol']}\n"
+                f"💰 Price: {result['price']}\n"
+                f"🎯 Target: {result['target']} | 🛑 SL: {result['sl']}\n"
+                f"📊 Reason: {result['reason']}\n"
+                f"🕒 Time: {result['time']}"
+            )
+            send_telegram(msg)
+            time.sleep(1)
 
-# =====================================
-# 🔹 MAIN LOOP (Streamlit Mode)
-# =====================================
-run_app = st.checkbox("✅ Run Live Analysis (refresh every 5 min)")
+    if results:
+        df = pd.DataFrame(results)
+        st.dataframe(df)
 
-while run_app:
-    table_data = []
-    for s in STOCKS:
-        try:
-            result = analyze_stock(s)
-            if result:
-                table_data.append(result)
-
-                if s not in active_trades:
-                    msg = (
-                        f"🕒 {result['time']}\n"
-                        f"📈 {result['symbol']} — {result['signal']}\n"
-                        f"💰 Price: ₹{result['price']}\n"
-                        f"🎯 Target: ₹{result['target']} | 🛑 SL: ₹{result['sl']}\n"
-                        f"🧠 Reason: {result['reason']}"
+        # === Monitor live price to detect hit ===
+        st.write("⏱ Checking live prices for Target/SL hit...")
+        for stock in results:
+            live_data = yf.download(stock["symbol"], period="1d", interval=INTERVAL, progress=False)
+            if not live_data.empty:
+                live_price = round(live_data["Close"].iloc[-1], 2)
+                status = check_hit_conditions(stock, live_price)
+                if status:
+                    hit_msg = (
+                        f"{status}\n"
+                        f"{stock['symbol']} | Live: {live_price} | Entry: {stock['price']}\n"
+                        f"🎯 Target: {stock['target']} | 🛑 SL: {stock['sl']}\n"
+                        f"🕒 {datetime.now().strftime('%H:%M:%S')}"
                     )
-                    send_telegram(msg)
-                    active_trades[s] = result
-
-            elif s in active_trades:
-                live_data = yf.download(s, period="1d", interval=INTERVAL, progress=False)
-                last_price = live_data["Close"].iloc[-1]
-                trade = active_trades[s]
-
-                # --- Check Target/SL Hit ---
-                if trade["signal"] == "BUY":
-                    if last_price >= trade["target"]:
-                        msg = (
-                            f"✅ {s} — Target Hit 🎯\n"
-                            f"⏱ Entry: ₹{trade['price']} → Exit: ₹{trade['target']} (+1.5%)\n"
-                            f"🕒 {datetime.now().strftime('%H:%M:%S')}"
-                        )
-                        send_telegram(msg)
-                        del active_trades[s]
-
-                    elif last_price <= trade["sl"]:
-                        msg = (
-                            f"❌ {s} — Stop Loss Hit 🛑\n"
-                            f"⏱ Entry: ₹{trade['price']} → Exit: ₹{trade['sl']} (-1.5%)\n"
-                            f"🕒 {datetime.now().strftime('%H:%M:%S')}"
-                        )
-                        send_telegram(msg)
-                        del active_trades[s]
-
-                elif trade["signal"] == "SELL":
-                    if last_price <= trade["target"]:
-                        msg = (
-                            f"✅ {s} — Target Hit 🎯\n"
-                            f"⏱ Entry: ₹{trade['price']} → Exit: ₹{trade['target']} (+1.5%)\n"
-                            f"🕒 {datetime.now().strftime('%H:%M:%S')}"
-                        )
-                        send_telegram(msg)
-                        del active_trades[s]
-
-                    elif last_price >= trade["sl"]:
-                        msg = (
-                            f"❌ {s} — Stop Loss Hit 🛑\n"
-                            f"⏱ Entry: ₹{trade['price']} → Exit: ₹{trade['sl']} (-1.5%)\n"
-                            f"🕒 {datetime.now().strftime('%H:%M:%S')}"
-                        )
-                        send_telegram(msg)
-                        del active_trades[s]
-
-        except Exception as e:
-            st.error(f"⚠️ Error analyzing {s}: {e}")
-            send_telegram(f"⚠️ Error analyzing {s}: {str(e)}")
-
-    if table_data:
-        df = pd.DataFrame(table_data)
-        placeholder.dataframe(df)
+                    send_telegram(hit_msg)
+                    st.warning(hit_msg)
+            time.sleep(1)
     else:
-        st.info("No clear signal yet. Waiting for next refresh...")
-
-    time.sleep(REFRESH_MINUTES * 60)
+        st.warning("No strong intraday signals found.")
